@@ -1,8 +1,7 @@
 from collections import namedtuple
-import json
 import itertools
 import requests
-from urllib.parse import urljoin, urlencode
+from urllib.parse import urljoin
 
 
 class PushTicketError(Exception):
@@ -120,9 +119,15 @@ class PushMessage(
                 In standalone and bare apps, defaults to false. (iOS Only)
 
     """
+
+    def check_tokens(tokens):
+        if isinstance(tokens, list):
+            return all(PushClient.is_exponent_push_token(t) for t in tokens)
+        return PushClient.is_exponent_push_token(tokens)
+
     def get_payload(self):
         # Sanity check for invalid push token format.
-        if not PushClient.is_exponent_push_token(self.to):
+        if not self.check_tokens(self.to):
             raise ValueError('Invalid push token')
 
         # There is only one required field.
@@ -169,8 +174,7 @@ PushMessage.__new__.__defaults__ = (None, ) * len(PushMessage._fields)
 
 
 class PushTicket(
-        namedtuple('PushTicket',
-                   ['push_message', 'status', 'message', 'details', 'id'])):
+        namedtuple('PushTicket', ['status', 'message', 'details', 'id'])):
     """Wrapper class for a push notification response.
 
     A successful single push notification:
@@ -298,12 +302,9 @@ class PushClient(object):
             self.api_url = PushClient.DEFAULT_BASE_API_URL
 
         self.force_fcm_v1 = force_fcm_v1
-
-        self.max_message_count = kwargs[
-            'max_message_count'] if 'max_message_count' in kwargs else PushClient.DEFAULT_MAX_MESSAGE_COUNT
-        self.max_receipt_count = kwargs[
-            'max_receipt_count'] if 'max_receipt_count' in kwargs else PushClient.DEFAULT_MAX_RECEIPT_COUNT
-        self.timeout = kwargs['timeout'] if 'timeout' in kwargs else None
+        self.max_message_count = kwargs.get('max_message_count', PushClient.DEFAULT_MAX_MESSAGE_COUNT)
+        self.max_receipt_count = kwargs.get('max_receipt_count', PushClient.DEFAULT_MAX_RECEIPT_COUNT)
+        self.timeout = kwargs.get('timeout', None)
 
         self.session = session
         if not self.session:
@@ -341,66 +342,26 @@ class PushClient(object):
         """
 
         url = urljoin(self.host, self.api_url + '/push/send')
-        if self.force_fcm_v1 is not None:
-            query_params = {'useFcmV1': 'true' if self.force_fcm_v1 else 'false'}
-            url += '?' + urlencode(query_params)
-
         response = self.session.post(
             url,
-            data=json.dumps([pm.get_payload() for pm in push_messages]),
+            params={'useFcmV1': 'true' if self.force_fcm_v1 else None},
+            json=[pm.get_payload() for pm in push_messages],
             timeout=self.timeout)
 
-        # Let's validate the response format first.
-        try:
-            response_data = response.json()
-        except ValueError:
-            # The response isn't json. First, let's attempt to raise a normal
-            # http error. If it's a 200, then we'll raise our own error.
-            response.raise_for_status()
-
-            raise PushServerError('Invalid server response', response)
-
-        # If there are errors with the entire request, raise an error now.
-        if 'errors' in response_data:
-            raise PushServerError('Request failed',
-                                  response,
-                                  response_data=response_data,
-                                  errors=response_data['errors'])
-
-        # We expect the response to have a 'data' field with the responses.
-        if 'data' not in response_data:
-            raise PushServerError('Invalid server response',
-                                  response,
-                                  response_data=response_data)
-
-        # Use the requests library's built-in exceptions for any remaining 4xx
-        # and 5xx errors.
-        response.raise_for_status()
-
-        # Sanity check the response
-        if len(push_messages) != len(response_data['data']):
-            raise PushServerError(
-                ('Mismatched response length. Expected %d %s but only '
-                 'received %d' %
-                 (len(push_messages), 'receipt' if len(push_messages) == 1 else
-                  'receipts', len(response_data['data']))),
-                response,
-                response_data=response_data)
+        response_data = self._validate_response(response)
 
         # At this point, we know it's a 200 and the response format is correct.
         # Now let's parse the responses(push_tickets) per push notification.
-        push_tickets = []
-        for i, push_ticket in enumerate(response_data['data']):
-            push_tickets.append(
-                PushTicket(
-                    push_message=push_messages[i],
-                    # If there is no status, assume error.
-                    status=push_ticket.get('status', PushTicket.ERROR_STATUS),
-                    message=push_ticket.get('message', ''),
-                    details=push_ticket.get('details', None),
-                    id=push_ticket.get('id', '')))
-
-        return push_tickets
+        return [
+            PushTicket(
+                # If there is no status, assume error.
+                status=push_ticket.get("status", PushTicket.ERROR_STATUS),
+                message=push_ticket.get("message", ""),
+                details=push_ticket.get("details", None),
+                id=push_ticket.get("id", ""),
+            )
+            for push_ticket in response_data["data"]
+        ]
 
     def publish(self, push_message):
         """Sends a single push notification
@@ -411,7 +372,7 @@ class PushClient(object):
         Returns:
            A PushTicket object which contains the results.
         """
-        return self.publish_multiple([push_message])[0]
+        return self._publish_internal([push_message])
 
     def publish_multiple(self, push_messages):
         """Sends multiple push notifications at once
@@ -422,64 +383,44 @@ class PushClient(object):
         Returns:
            An array of PushTicket objects which contains the results.
         """
-        push_tickets = []
-        for start in itertools.count(0, self.max_message_count):
-            chunk = list(
-                itertools.islice(push_messages, start,
-                                 start + self.max_message_count))
-            if not chunk:
-                break
-            push_tickets.extend(self._publish_internal(chunk))
-        return push_tickets
+        push_tickets = itertools.chain.from_iterable(
+            self._publish_internal(chunk)
+            for chunk in self._batch(push_messages, self.max_message_count)
+        )
+        return list(push_tickets)
 
     def check_receipts_multiple(self, push_tickets):
         """
         Check receipts in batches of 1000 as per expo docs
         """
-        receipts = []
-        for start in itertools.count(0, self.max_receipt_count):
-            chunk = list(
-                itertools.islice(push_tickets, start,
-                                 start + self.max_receipt_count))
-            if not chunk:
-                break
-            receipts.extend(self._check_receipts_internal(chunk))
-        return receipts
+        receipts = itertools.chain.from_iterable(
+            self.check_receipts(chunk)
+            for chunk in self._batch(push_tickets, self.max_receipt_count)
+        )
+        return list(receipts)
 
-    def _check_receipts_internal(self, push_tickets):
-        """
-        Helper function for check_receipts_multiple
-        """
+    def check_receipts(self, push_tickets):
+        """  Checks the push receipts of the given push tickets """
         response = self.session.post(
             self.host + self.api_url + '/push/getReceipts',
             json={'ids': [push_ticket.id for push_ticket in push_tickets]},
             timeout=self.timeout)
 
-        receipts = self.validate_and_get_receipts(response)
-        return receipts
+        response_data = self._validate_response(response)
 
-    def check_receipts(self, push_tickets):
-        """  Checks the push receipts of the given push tickets """
-        # Delayed import because this file is immediately read on install, and
-        # the requests library may not be installed yet.
-        response = requests.post(
-            self.host + self.api_url + '/push/getReceipts',
-            data=json.dumps(
-                {'ids': [push_ticket.id for push_ticket in push_tickets]}),
-            headers={
-                'accept': 'application/json',
-                'accept-encoding': 'gzip, deflate',
-                'content-type': 'application/json',
-            },
-            timeout=self.timeout)
-        receipts = self.validate_and_get_receipts(response)
-        return receipts
-
-    def validate_and_get_receipts(self, response):
-        """
-        Validate and get receipts for requests
-        """
-        # Let's validate the response format first.
+        # At this point, we know it's a 200 and the response format is correct.
+        # Now let's parse the responses per push notification.
+        return [
+            PushReceipt(
+                id=r_id,
+                status=val.get("status", PushTicket.ERROR_STATUS),
+                message=val.get("message", ""),
+                details=val.get("details", None),
+            )
+            for r_id, val in response_data['data'].items()
+        ]
+    
+    def _validate_response(self, response):
         try:
             response_data = response.json()
         except ValueError:
@@ -504,16 +445,9 @@ class PushClient(object):
         # Use the requests library's built-in exceptions for any remaining 4xx
         # and 5xx errors.
         response.raise_for_status()
-
-        # At this point, we know it's a 200 and the response format is correct.
-        # Now let's parse the responses per push notification.
-        response_data = response_data['data']
-        ret = []
-        for r_id, val in response_data.items():
-            ret.append(
-                PushTicket(push_message=PushMessage(),
-                           status=val.get('status', PushTicket.ERROR_STATUS),
-                           message=val.get('message', ''),
-                           details=val.get('details', None),
-                           id=r_id))
-        return ret
+        return response_data
+    
+    def _batch(self, iterable, n):
+        iterator = iter(iterable)
+        while batch := itertools.islice(iterator, n):
+            yield batch
